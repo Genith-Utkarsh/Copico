@@ -75,7 +75,10 @@ Optional tuning:
 1. Open your bot chat.
 2. Type `/start`.
 3. Tap `/model` and choose provider from inline buttons.
-4. Send API key (for Ollama you can send `SKIP`).
+4. Send provider setup:
+   - NVIDIA: first send NVIDIA model ID (example `nvidia/ising-calibration-1-35b-a3b`), then send NVIDIA API key.
+   - Ollama: you can send `SKIP` if no API key is needed.
+   - Other providers: send API key directly.
 5. Type `/createsession`.
 6. Copy text from browser with **Alt+C** multiple times.
 7. Type `/submit`.

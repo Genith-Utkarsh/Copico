@@ -36,7 +36,7 @@ const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || "http://localhost:
 );
 
 const SETTINGS_FILE_PATH = path.join(__dirname, "data", "chat-settings.json");
-const pendingApiKeyByChat = new Map();
+const pendingSetupByChat = new Map();
 const lastSubmitAtByChat = new Map();
 
 const SESSION_MESSAGE_SEPARATOR = "\n\n";
@@ -314,6 +314,33 @@ function getProviderDefaults(model) {
   return modelKey ? MODEL_OPTIONS[modelKey] || null : null;
 }
 
+function getConfiguredModelName(modelKey, settings) {
+  const provider = getProviderDefaults(modelKey);
+
+  if (!provider) {
+    return "";
+  }
+
+  if (modelKey === "nvidia") {
+    const configured = String(settings?.nvidiaModel || "").trim();
+    return configured || provider.defaultModel;
+  }
+
+  return provider.defaultModel;
+}
+
+function isApiKeyRequired(modelKey) {
+  return modelKey !== "ollama";
+}
+
+function isModelConfigurationComplete(modelKey, settings) {
+  if (modelKey === "nvidia") {
+    return Boolean(String(settings?.nvidiaModel || "").trim());
+  }
+
+  return true;
+}
+
 function getProviderLabel(model) {
   return getProviderDefaults(model)?.label || "Unknown";
 }
@@ -396,6 +423,7 @@ function getHelpMessage() {
     "/help - show help",
     "",
     "Flow: /createsession -> copy text with Alt+C -> /submit -> /clearsession",
+    "For NVIDIA: choose model in /model, then send NVIDIA model ID and API key.",
     "Alt+X also works for direct quick question mode.",
   ].join("\n");
 }
@@ -414,15 +442,31 @@ function getSettingsMessage(chatId) {
     ].join("\n");
   }
 
-  const apiKeyRequired = normalizeModel(settings.model) !== "ollama";
+  const modelKey = normalizeModel(settings.model);
+  const apiKeyRequired = isApiKeyRequired(modelKey);
+  const configuredModelName = String(settings?.nvidiaModel || "").trim();
+  const modelLine =
+    modelKey === "nvidia"
+      ? `Model: ${provider.label} (${configuredModelName || "not set"})`
+      : `Model: ${provider.label}`;
+  const nvidiaNoteLine =
+    modelKey === "nvidia" && !configuredModelName
+      ? "NVIDIA model name: missing (run /model and pick NVIDIA again)."
+      : null;
 
-  return [
-    `Model: ${provider.label}`,
+  const lines = [
+    modelLine,
     `API key: ${apiKeyRequired ? maskApiKey(settings.apiKey) : "optional for Ollama"}`,
     `Session: ${session.active ? "active" : "inactive"} (${session.messages.length} messages)`,
     `Limits: ${MAX_SESSION_MESSAGES} messages, ${MAX_SESSION_INPUT_CHARS} chars`,
     "Use /createsession, /submit, /clearsession for session flow.",
-  ].join("\n");
+  ];
+
+  if (nvidiaNoteLine) {
+    lines.splice(1, 0, nvidiaNoteLine);
+  }
+
+  return lines.join("\n");
 }
 
 function hashText(value) {
@@ -556,8 +600,34 @@ async function setModelAndAskForApiKey(chatId, model) {
     return;
   }
 
-  updateChatSettings(chatId, { model: modelKey, apiKey: "" });
-  pendingApiKeyByChat.set(String(chatId), modelKey);
+  pendingSetupByChat.delete(String(chatId));
+  updateChatSettings(chatId, {
+    model: modelKey,
+    apiKey: "",
+    nvidiaModel: "",
+  });
+
+  if (modelKey === "nvidia") {
+    pendingSetupByChat.set(String(chatId), {
+      model: modelKey,
+      step: "nvidia_model",
+    });
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        "Model selected: NVIDIA",
+        "Now send the NVIDIA model ID you want to use.",
+        "Example: nvidia/ising-calibration-1-35b-a3b",
+      ].join("\n")
+    );
+    return;
+  }
+
+  pendingSetupByChat.set(String(chatId), {
+    model: modelKey,
+    step: "api_key",
+  });
 
   if (modelKey === "ollama") {
     await sendTelegramMessage(
@@ -602,12 +672,23 @@ async function submitSessionForChat(chatId) {
     return;
   }
 
-  if (modelKey !== "ollama" && !settings?.apiKey) {
+  if (!isModelConfigurationComplete(modelKey, settings)) {
+    await sendTelegramMessage(
+      chatId,
+      "NVIDIA model name is missing. Run /model and select NVIDIA again."
+    );
+    return;
+  }
+
+  if (isApiKeyRequired(modelKey) && !settings?.apiKey) {
     await sendTelegramMessage(chatId, "API key missing. Run /model and send your API key.");
     return;
   }
 
   const provider = getProviderDefaults(modelKey);
+  const configuredModelName = getConfiguredModelName(modelKey, settings);
+  const modelDisplayName =
+    modelKey === "nvidia" ? `${provider?.label} (${configuredModelName})` : provider?.label;
 
   if (!provider) {
     await sendTelegramMessage(chatId, "Unsupported model in settings. Run /change_model.");
@@ -648,38 +729,47 @@ async function submitSessionForChat(chatId) {
     );
   }
 
-  const inputHash = hashText(`${modelKey}\n${prepared.input}`);
+  const inputHash = hashText(`${modelKey}\n${configuredModelName}\n${prepared.input}`);
   const cached = settings?.sessionCache;
 
   if (
     cached &&
     cached.model === modelKey &&
+    cached.modelName === configuredModelName &&
     cached.inputHash === inputHash &&
     typeof cached.answer === "string" &&
     cached.answer.trim()
   ) {
     await sendLongTelegramMessage(
       chatId,
-      [
-        `Session submitted: ${prepared.usedCount} messages`,
-        `Model: ${provider.label}`,
-        "",
-        "AI Answer (cached):",
-        cached.answer.trim(),
-      ].join("\n")
+        [
+          `Session submitted: ${prepared.usedCount} messages`,
+          `Model: ${modelDisplayName}`,
+          "",
+          "AI Answer (cached):",
+          cached.answer.trim(),
+        ].join("\n")
     );
     return;
   }
 
-  await sendTelegramMessage(chatId, `Analyzing with ${provider.label}...`);
+  await sendTelegramMessage(
+    chatId,
+    modelKey === "nvidia"
+      ? `Analyzing with ${provider.label} (${configuredModelName})...`
+      : `Analyzing with ${provider.label}...`
+  );
 
   try {
-    const answer = await generateAiAnswer(modelKey, settings?.apiKey, prepared.input);
+    const answer = await generateAiAnswer(modelKey, settings?.apiKey, prepared.input, {
+      configuredModelName,
+    });
 
     updateChatSettings(chatId, {
       model: modelKey,
       sessionCache: {
         model: modelKey,
+        modelName: configuredModelName,
         inputHash,
         answer,
         cachedAt: new Date().toISOString(),
@@ -690,7 +780,7 @@ async function submitSessionForChat(chatId) {
       chatId,
       [
         `Session submitted: ${prepared.usedCount} messages`,
-        `Model: ${provider.label}`,
+        `Model: ${modelDisplayName}`,
         "",
         "AI Answer:",
         answer,
@@ -768,35 +858,89 @@ async function handleTelegramMessage(message) {
     return;
   }
 
-  const pendingModel = pendingApiKeyByChat.get(chatId);
+  const pendingSetup = pendingSetupByChat.get(chatId);
 
-  if (pendingModel) {
-    const lowered = text.toLowerCase();
-    let apiKey = text;
+  if (pendingSetup?.model === "nvidia" && pendingSetup.step === "nvidia_model") {
+    const nvidiaModel = text.trim();
 
-    if (pendingModel === "ollama" && (lowered === "skip" || lowered === "/skip")) {
-      apiKey = "";
-    }
-
-    if (pendingModel !== "ollama" && !apiKey.trim()) {
-      await sendTelegramMessage(chatId, "API key cannot be empty. Send it again.");
+    if (!nvidiaModel) {
+      await sendTelegramMessage(chatId, "NVIDIA model name cannot be empty. Send it again.");
       return;
     }
 
-    updateChatSettings(chatId, {
-      model: pendingModel,
-      apiKey: apiKey.trim(),
+    pendingSetupByChat.set(chatId, {
+      model: "nvidia",
+      step: "api_key",
+      nvidiaModel,
     });
 
-    pendingApiKeyByChat.delete(chatId);
+    updateChatSettings(chatId, {
+      model: "nvidia",
+      nvidiaModel,
+      apiKey: "",
+    });
 
     await sendTelegramMessage(
       chatId,
       [
-        `API key saved for ${getProviderLabel(pendingModel)}.`,
-        "Now /submit and Alt+X can use this model.",
-        "Use /settings to verify or /change_model to switch.",
+        `NVIDIA model saved: ${nvidiaModel}`,
+        "Now send your NVIDIA API key.",
       ].join("\n")
+    );
+    return;
+  }
+
+  if (pendingSetup?.step === "api_key") {
+    const modelKey = normalizeModel(pendingSetup.model);
+
+    if (!modelKey) {
+      pendingSetupByChat.delete(chatId);
+      await sendTelegramMessage(chatId, "Setup state expired. Run /model again.");
+      return;
+    }
+
+    const lowered = text.toLowerCase();
+    let apiKey = text;
+
+    if (modelKey === "ollama" && (lowered === "skip" || lowered === "/skip")) {
+      apiKey = "";
+    }
+
+    if (isApiKeyRequired(modelKey) && !apiKey.trim()) {
+      await sendTelegramMessage(chatId, "API key cannot be empty. Send it again.");
+      return;
+    }
+
+    const updates = {
+      model: modelKey,
+      apiKey: apiKey.trim(),
+      nvidiaModel: modelKey === "nvidia" ? String(pendingSetup.nvidiaModel || "").trim() : "",
+    };
+
+    updateChatSettings(chatId, {
+      ...updates,
+    });
+
+    pendingSetupByChat.delete(chatId);
+
+    const configuredModelLine =
+      modelKey === "nvidia" && updates.nvidiaModel
+        ? `NVIDIA model: ${updates.nvidiaModel}`
+        : null;
+
+    const messageLines = [
+      `API key saved for ${getProviderLabel(modelKey)}.`,
+      "Now /submit and Alt+X can use this model.",
+      "Use /settings to verify or /change_model to switch.",
+    ];
+
+    if (configuredModelLine) {
+      messageLines.splice(1, 0, configuredModelLine);
+    }
+
+    await sendTelegramMessage(
+      chatId,
+      messageLines.join("\n")
     );
     return;
   }
@@ -1021,19 +1165,26 @@ async function askClaude(apiKey, question) {
   return answer;
 }
 
-async function askNvidia(apiKey, question) {
-  const model = MODEL_OPTIONS.nvidia.defaultModel;
+async function askNvidia(apiKey, modelName, question) {
+  const stream = false;
+  const model = String(modelName || "").trim() || MODEL_OPTIONS.nvidia.defaultModel;
 
   const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
+      Accept: stream ? "text/event-stream" : "application/json",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model,
+      max_tokens: 32768,
       temperature: 0.2,
-      max_tokens: MAX_AI_OUTPUT_TOKENS,
+      top_p: 1.0,
+      stream,
+      chat_template_kwargs: {
+        enable_thinking: true,
+      },
       messages: [
         {
           role: "user",
@@ -1134,7 +1285,7 @@ async function askOllama(apiKey, question) {
   return answer;
 }
 
-async function generateAiAnswer(model, apiKey, question) {
+async function generateAiAnswer(model, apiKey, question, options = {}) {
   const modelKey = normalizeModel(model);
 
   if (!modelKey) {
@@ -1158,7 +1309,7 @@ async function generateAiAnswer(model, apiKey, question) {
   }
 
   if (modelKey === "nvidia") {
-    return askNvidia(apiKey, question);
+    return askNvidia(apiKey, options.configuredModelName, question);
   }
 
   if (modelKey === "openrouter") {
@@ -1269,7 +1420,14 @@ app.post("/ask", async (req, res) => {
     });
   }
 
-  if (modelKey !== "ollama" && !settings?.apiKey) {
+  if (!isModelConfigurationComplete(modelKey, settings)) {
+    return res.status(400).json({
+      ok: false,
+      error: "NVIDIA model name is missing. Select NVIDIA in /model and set model name.",
+    });
+  }
+
+  if (isApiKeyRequired(modelKey) && !settings?.apiKey) {
     return res.status(400).json({
       ok: false,
       error: "API key missing. Open Telegram bot and send API key after selecting model.",
@@ -1277,20 +1435,32 @@ app.post("/ask", async (req, res) => {
   }
 
   const provider = getProviderDefaults(modelKey);
+
+  if (!provider) {
+    return res.status(400).json({
+      ok: false,
+      error: "Unsupported model in saved settings. Use /change_model in Telegram.",
+    });
+  }
+
+  const configuredModelName = getConfiguredModelName(modelKey, settings);
+  const modelDisplayName =
+    modelKey === "nvidia" ? `${provider.label} (${configuredModelName})` : provider.label;
   const question = compactWhitespace(parsed.text).slice(0, MAX_SESSION_INPUT_CHARS);
-  const questionHash = hashText(`${modelKey}\n${question}`);
+  const questionHash = hashText(`${modelKey}\n${configuredModelName}\n${question}`);
   const cached = settings?.quickAskCache;
 
   try {
     if (
       cached &&
       cached.model === modelKey &&
+      cached.modelName === configuredModelName &&
       cached.inputHash === questionHash &&
       typeof cached.answer === "string" &&
       cached.answer.trim()
     ) {
       const outputMessage = [
-        `Model: ${provider?.label || modelKey}`,
+        `Model: ${modelDisplayName}`,
         "",
         `Question: ${question}`,
         "",
@@ -1306,9 +1476,11 @@ app.post("/ask", async (req, res) => {
       });
     }
 
-    const answer = await generateAiAnswer(modelKey, settings?.apiKey, question);
+    const answer = await generateAiAnswer(modelKey, settings?.apiKey, question, {
+      configuredModelName,
+    });
     const outputMessage = [
-      `Model: ${provider?.label || modelKey}`,
+      `Model: ${modelDisplayName}`,
       "",
       `Question: ${question}`,
       "",
@@ -1319,6 +1491,7 @@ app.post("/ask", async (req, res) => {
       model: modelKey,
       quickAskCache: {
         model: modelKey,
+        modelName: configuredModelName,
         inputHash: questionHash,
         answer,
         cachedAt: new Date().toISOString(),
