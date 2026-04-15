@@ -34,6 +34,9 @@ const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || "http://localhost:
   /\/+$/,
   ""
 );
+const TELEGRAM_MAX_RETRIES = parsePositiveInteger(process.env.TELEGRAM_MAX_RETRIES, 3);
+const TELEGRAM_RETRY_BASE_MS = parsePositiveInteger(process.env.TELEGRAM_RETRY_BASE_MS, 800);
+const TELEGRAM_FORCE_IPV4 = String(process.env.TELEGRAM_FORCE_IPV4 || "1") !== "0";
 
 const SETTINGS_FILE_PATH = path.join(__dirname, "data", "chat-settings.json");
 const pendingSetupByChat = new Map();
@@ -70,6 +73,17 @@ const MODEL_OPTIONS = {
 
 let telegramOffset = 0;
 let isPollingTelegram = false;
+let telegramDispatcher = null;
+
+if (TELEGRAM_FORCE_IPV4) {
+  try {
+    // Prefer IPv4 to avoid environments where IPv6 routes to Telegram are unstable.
+    const { Agent } = require("undici");
+    telegramDispatcher = new Agent({ connect: { family: 4 } });
+  } catch (error) {
+    telegramDispatcher = null;
+  }
+}
 
 function ensureSettingsFile() {
   fs.mkdirSync(path.dirname(SETTINGS_FILE_PATH), { recursive: true });
@@ -473,6 +487,12 @@ function hashText(value) {
   return crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex");
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 function getSubmitCooldownState(chatId) {
   const now = Date.now();
   const key = String(chatId);
@@ -518,30 +538,91 @@ function extractErrorMessage(data, fallbackStatus) {
   return `HTTP ${fallbackStatus}`;
 }
 
+function isTransientNetworkError(error) {
+  const code = error?.code || error?.cause?.code;
+  return [
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "ECONNREFUSED",
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_SOCKET",
+    "UND_ERR_REQUEST_TIMEOUT",
+  ].includes(code);
+}
+
+function summarizeError(error) {
+  const directCode = error?.code;
+  const causeCode = error?.cause?.code;
+  const message = error?.message || "Unknown error";
+  const causeMessage = error?.cause?.message;
+
+  if (directCode && causeCode) {
+    return `${message} (code=${directCode}, cause=${causeCode}${
+      causeMessage ? `: ${causeMessage}` : ""
+    })`;
+  }
+
+  if (directCode) {
+    return `${message} (code=${directCode})`;
+  }
+
+  if (causeCode) {
+    return `${message} (cause=${causeCode}${causeMessage ? `: ${causeMessage}` : ""})`;
+  }
+
+  return message;
+}
+
 async function callTelegram(method, payload = {}) {
   if (!TELEGRAM_BOT_TOKEN) {
     throw new Error("TELEGRAM_BOT_TOKEN is missing");
   }
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= TELEGRAM_MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+          ...(telegramDispatcher ? { dispatcher: telegramDispatcher } : {}),
+        }
+      );
+
+      const data = await parseJsonSafe(response);
+
+      if (!response.ok || !data?.ok) {
+        const detail = extractErrorMessage(data, response.status);
+        throw new Error(`Telegram API failed: ${detail}`);
+      }
+
+      return data.result;
+    } catch (error) {
+      lastError = error;
+
+      if (!isTransientNetworkError(error) || attempt >= TELEGRAM_MAX_RETRIES) {
+        throw error;
+      }
+
+      const delayMs = TELEGRAM_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+      console.warn(
+        `[TELEGRAM_RETRY] ${method} failed (${summarizeError(
+          error
+        )}), retrying in ${delayMs}ms [attempt ${attempt}/${TELEGRAM_MAX_RETRIES}]`
+      );
+      await sleep(delayMs);
     }
-  );
-
-  const data = await parseJsonSafe(response);
-
-  if (!response.ok || !data?.ok) {
-    const detail = extractErrorMessage(data, response.status);
-    throw new Error(`Telegram API failed: ${detail}`);
   }
 
-  return data.result;
+  throw lastError || new Error("Telegram request failed.");
 }
 
 async function sendTelegramMessage(chatId, text, extra = {}) {
@@ -998,16 +1079,17 @@ async function initializeTelegramOffset() {
   }
 
   try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1&limit=1&timeout=0`
-    );
-    const data = await parseJsonSafe(response);
+    const updates = await callTelegram("getUpdates", {
+      offset: -1,
+      limit: 1,
+      timeout: 0,
+    });
 
-    if (response.ok && data?.ok && Array.isArray(data.result) && data.result.length > 0) {
-      telegramOffset = data.result[data.result.length - 1].update_id + 1;
+    if (Array.isArray(updates) && updates.length > 0) {
+      telegramOffset = updates[updates.length - 1].update_id + 1;
     }
   } catch (error) {
-    console.error("[TELEGRAM_INIT_ERROR]", error);
+    console.error(`[TELEGRAM_INIT_ERROR] ${summarizeError(error)}`);
   }
 }
 
@@ -1026,11 +1108,29 @@ async function pollTelegramUpdates() {
     });
 
     for (const update of updates) {
-      telegramOffset = update.update_id + 1;
-      await handleTelegramUpdate(update);
+      try {
+        await handleTelegramUpdate(update);
+        telegramOffset = update.update_id + 1;
+      } catch (updateError) {
+        if (isTransientNetworkError(updateError)) {
+          console.warn(
+            `[TELEGRAM_UPDATE_RETRY] update_id=${update.update_id} failed transiently: ${summarizeError(
+              updateError
+            )}`
+          );
+          break;
+        }
+
+        console.error(
+          `[TELEGRAM_UPDATE_SKIP] update_id=${update.update_id} skipped: ${summarizeError(
+            updateError
+          )}`
+        );
+        telegramOffset = update.update_id + 1;
+      }
     }
   } catch (error) {
-    console.error("[TELEGRAM_POLL_ERROR]", error);
+    console.error(`[TELEGRAM_POLL_ERROR] ${summarizeError(error)}`);
   } finally {
     isPollingTelegram = false;
   }
