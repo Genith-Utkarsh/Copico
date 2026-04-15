@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Copico Text Sender",
+  "version": "1.1.0",
+  "description": "Alt+C sends selected text. Alt+X asks AI and sends answer to Telegram.",
+  "permissions": ["activeTab", "scripting", "tabs"],
+  "host_permissions": ["http://localhost:3000/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Copico: Send selected text"
+  },
+  "commands": {
+    "capture-selected-text": {
+      "suggested_key": {
+        "default": "Alt+C"
+      },
+      "description": "Capture selected text and send it to backend"
+    },
+    "ask-ai-about-selection": {
+      "suggested_key": {
+        "default": "Alt+X"
+      },
+      "description": "Ask AI about selected text and send answer to Telegram"
+    }
+  }
+}
